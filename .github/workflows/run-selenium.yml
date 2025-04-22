@@ -1,0 +1,85 @@
+name: Run Selenium Tests on EC2
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-southeast-2                    # Update this if you're using a different region
+  AMI_ID: ami-09e970c8f1107e4f7                # Replace with latest Ubuntu 22.04 AMI in your region
+  INSTANCE_TYPE: t2.micro
+  KEY_NAME: selenium-key
+  SECURITY_GROUP_NAME: selenium-sg
+  BUCKET_NAME: selenium-test-logs
+  INSTANCE_TAG: SeleniumTestInstance
+
+jobs:
+  run-selenium-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Set up AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Save PEM Key
+      run: |
+        echo "${{ secrets.EC2_PRIVATE_KEY }}" > selenium-key.pem
+        chmod 400 selenium-key.pem
+
+    - name: Launch EC2 Instance
+      id: ec2
+      run: |
+        INSTANCE_ID=$(aws ec2 run-instances \
+          --image-id ${{ env.AMI_ID }} \
+          --count 1 \
+          --instance-type ${{ env.INSTANCE_TYPE }} \
+          --key-name ${{ env.KEY_NAME }} \
+          --security-groups ${{ env.SECURITY_GROUP_NAME }} \
+          --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ env.INSTANCE_TAG }}}]" \
+          --query 'Instances[0].InstanceId' \
+          --output text)
+
+        echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+
+        echo "Waiting for instance to be running..."
+        aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+
+        PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+          --query 'Reservations[0].Instances[0].PublicIpAddress' \
+          --output text)
+
+        echo "EC2_PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+
+    - name: Wait for SSH to become available
+      run: |
+        echo "Waiting for EC2 to be SSH ready..."
+        for i in {1..30}; do
+          ssh -o StrictHostKeyChecking=no -i selenium-key.pem ubuntu@${{ env.EC2_PUBLIC_IP }} 'echo SSH Ready' && break
+          sleep 10
+        done
+
+    - name: Transfer test code to EC2
+      run: |
+        scp -o StrictHostKeyChecking=no -i selenium-key.pem -r . ubuntu@${{ env.EC2_PUBLIC_IP }}:/home/ubuntu/project
+
+    - name: Run tests remotely on EC2
+      run: |
+        ssh -o StrictHostKeyChecking=no -i selenium-key.pem ubuntu@${{ env.EC2_PUBLIC_IP }} << 'EOF'
+          sudo apt update && sudo apt install -y python3-pip chromium-browser unzip curl
+          pip3 install selenium pytest webdriver-manager boto3
+          cd project/tests
+          pytest --junitxml=results.xml
+          aws s3 cp results.xml s3://${{ env.BUCKET_NAME }}/results-$(date +%s).xml
+        EOF
+
+    - name: Terminate EC2 Instance
+      run: |
+        aws ec2 terminate-instances --instance-ids ${{ env.INSTANCE_ID }}
+        echo "Waiting for EC2 termination..."
+        aws ec2 wait instance-terminated --instance-ids ${{ env.INSTANCE_ID }}
