@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
 
 env:
-  AWS_REGION: ap-southeast-2                    # Update this if you're using a different region
-  AMI_ID: ami-09e970c8f1107e4f7                # Replace with latest Ubuntu 22.04 AMI in your region
+  AWS_REGION: ap-southeast-2
+  AMI_ID: ami-09e970c8f1107e4f7
   INSTANCE_TYPE: t2.micro
   KEY_NAME: selenium-key
   SECURITY_GROUP_NAME: selenium-sg
@@ -23,9 +23,9 @@ jobs:
     - name: Set up AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
       with:
-        aws-access-key-id: AKIA5YVPOJNMGXVMNIE7
-        aws-secret-access-key: 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
-        aws-region: ap-southeast-2
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
 
     - name: Save PEM Key
       run: |
@@ -71,10 +71,31 @@ jobs:
     - name: Run tests remotely on EC2
       run: |
         ssh -o StrictHostKeyChecking=no -i selenium-key.pem ubuntu@${{ env.EC2_PUBLIC_IP }} << 'EOF'
-          sudo apt update && sudo apt install -y python3-pip chromium-browser unzip curl
+          set -e
+          exec > >(tee /home/ubuntu/test-log.txt) 2>&1
+
+          sudo apt update
+          sudo apt install -y wget unzip curl gnupg2 python3-pip
+
+          # Install Chrome
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
+          sudo apt update
+          sudo apt install -y google-chrome-stable
+
+          # Install ChromeDriver matching version
+          CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+')
+          CHROMEDRIVER_VERSION=$(curl -s "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_$CHROME_VERSION")
+          wget -N https://chromedriver.storage.googleapis.com/$CHROMEDRIVER_VERSION/chromedriver_linux64.zip
+          unzip chromedriver_linux64.zip
+          sudo mv chromedriver /usr/local/bin/
+          chmod +x /usr/local/bin/chromedriver
+
           pip3 install selenium pytest webdriver-manager boto3
-          cd project/tests
+
+          cd /home/ubuntu/project/tests
           pytest --junitxml=results.xml
+
           aws s3 cp results.xml s3://${{ env.BUCKET_NAME }}/results-$(date +%s).xml
         EOF
 
